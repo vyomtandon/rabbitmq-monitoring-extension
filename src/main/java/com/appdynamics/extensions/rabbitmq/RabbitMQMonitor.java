@@ -1,11 +1,21 @@
 package com.appdynamics.extensions.rabbitmq;
 
+import java.io.OutputStreamWriter;
 import java.util.HashMap;
 import java.util.List;
 import java.util.Map;
+import java.util.concurrent.Executors;
+import java.util.concurrent.ScheduledExecutorService;
+import java.util.concurrent.TimeUnit;
 import java.util.regex.Matcher;
 import java.util.regex.Pattern;
 
+import com.appdynamics.TaskInputArgs;
+import com.appdynamics.extensions.crypto.CryptoUtil;
+import com.appdynamics.extensions.util.DeltaMetricsCalculator;
+import com.google.common.collect.Maps;
+import org.apache.log4j.ConsoleAppender;
+import org.apache.log4j.Level;
 import org.apache.log4j.Logger;
 
 import com.appdynamics.extensions.conf.MonitorConfiguration;
@@ -19,6 +29,7 @@ import com.singularity.ee.agent.systemagent.api.AManagedMonitor;
 import com.singularity.ee.agent.systemagent.api.TaskExecutionContext;
 import com.singularity.ee.agent.systemagent.api.TaskOutput;
 import com.singularity.ee.agent.systemagent.api.exception.TaskExecutionException;
+import org.apache.log4j.PatternLayout;
 
 /**
  * Created with IntelliJ IDEA.
@@ -38,6 +49,7 @@ public class RabbitMQMonitor extends AManagedMonitor {
 	//Holds the Key-Description Mapping
 	private Map<String, String> dictionary;
 
+	private final DeltaMetricsCalculator deltaCalculator = new DeltaMetricsCalculator(10);
 
 
 	private boolean initialized;
@@ -47,31 +59,11 @@ public class RabbitMQMonitor extends AManagedMonitor {
 		String msg = "Using Monitor Version [" + getImplementationVersion() + "]";
 		logger.info(msg);
 		dictionary = new HashMap<String, String>();
-		dictionary.put("ack", "Acknowledged");
-		dictionary.put("deliver", "Delivered");
-		dictionary.put("deliver_get", "Delivered (Total)");
-		dictionary.put("deliver_no_ack", "Delivered No-Ack");
-		dictionary.put("get", "Got");
-		dictionary.put("get_no_ack", "Got No-Ack");
-		dictionary.put("publish", "Published");
-		dictionary.put("redeliver", "Redelivered");
-		dictionary.put("messages_ready", "Available");
-		dictionary.put("messages_unacknowledged", "Pending Acknowledgements");
-		dictionary.put("consumers", "Count");
-		dictionary.put("active_consumers", "Active");
-		dictionary.put("idle_consumers", "Idle");
-		dictionary.put("slave_nodes", "Slaves Count");
-		dictionary.put("synchronised_slave_nodes", "Synchronized Slaves Count");
-		dictionary.put("down_slave_nodes", "Down Slaves Count");
-		dictionary.put("messages", "Messages");
 	}
 
 	private void configure(Map<String, String> argsMap) {
 		logger.info("Initializing the RabbitMQ Configuration");
 		MetricWriteHelper metricWriteHelper = MetricWriteHelperFactory.create(this);
-		if(!Strings.isNullOrEmpty(argsMap.get("metricPrefix"))){
-			metricPrefix = argsMap.get("metricPrefix");
-		}
 		MonitorConfiguration conf = new MonitorConfiguration(metricPrefix, new TaskRunnable(), metricWriteHelper);
 		String configFileName = argsMap.get("config-file");
 		if(Strings.isNullOrEmpty(configFileName)){
@@ -81,6 +73,10 @@ public class RabbitMQMonitor extends AManagedMonitor {
 		conf.checkIfInitialized(MonitorConfiguration.ConfItem.CONFIG_YML, MonitorConfiguration.ConfItem.EXECUTOR_SERVICE,
 				MonitorConfiguration.ConfItem.METRIC_PREFIX, MonitorConfiguration.ConfItem.METRIC_WRITE_HELPER);
 		this.configuration = conf;
+		String prefix = (String)this.configuration.getConfigYml().get("metricPrefix");
+		if(!Strings.isNullOrEmpty(prefix)){
+			metricPrefix = prefix;
+		}
 		initialized = true;
 	}
 
@@ -91,7 +87,7 @@ public class RabbitMQMonitor extends AManagedMonitor {
 			String excludeQueueRegex = instances.getExcludeQueueRegex();
 			if(config!=null){
 				for(InstanceInfo info : instances.getInstances()){
-					configuration.getExecutorService().execute(new RabbitMQMonitoringTask(configuration, info,dictionary,instances.getQueueGroups(),metricPrefix,excludeQueueRegex));
+					configuration.getExecutorService().execute(new RabbitMQMonitoringTask(configuration, info,dictionary,instances.getQueueGroups(),metricPrefix,excludeQueueRegex, deltaCalculator));
 				}
 			}
 			else{
@@ -105,40 +101,11 @@ public class RabbitMQMonitor extends AManagedMonitor {
 		}
 		initialiseInstances(this.configuration.getConfigYml());
 		logger.info("Starting the RabbitMQ Metric Monitoring task");
-		argsMap = checkArgs(argsMap);
 		if (logger.isDebugEnabled()) {
 			logger.debug("The arguments after appending the default values are " + argsMap);
 		}
 		configuration.executeTask();
 		return new TaskOutput("RabbitMQ Metric Upload Complete ");
-	}
-
-	/**
-	 * Defaults the value if not present.
-	 *
-	 * @param argsMapsActual
-	 * @return
-	 */
-	protected Map<String, String> checkArgs(Map<String, String> argsMapsActual) {
-		Map<String, String> newArgsMap;
-		if (argsMapsActual != null) {
-			newArgsMap = new HashMap<String, String>(argsMapsActual);
-		} else {
-			newArgsMap = new HashMap<String, String>();
-		}
-		String prefix = newArgsMap.get("metricPrefix");
-		if (prefix == null) {
-			newArgsMap.put("metricPrefix", RabbitMQMonitor.DEFAULT_METRIC_PREFIX);
-		} else {
-			String trim = prefix.trim();
-			Pattern compile = Pattern.compile("(.+?)(\\|+)");
-			Matcher matcher = compile.matcher(trim);
-			if (matcher.matches()) {
-				trim = matcher.group(1);
-			}
-			newArgsMap.put("metricPrefix", trim + "|");
-		}
-		return newArgsMap;
 	}
 
 	private void initialiseInstances(Map<String, ?> configYml) {
@@ -170,6 +137,19 @@ public class RabbitMQMonitor extends AManagedMonitor {
 
 				if(!Strings.isNullOrEmpty((String) instance.get("password"))){
 					info.setPassword((String) instance.get("password"));
+				}
+				else if(!Strings.isNullOrEmpty((String) instance.get("encryptedPassword"))){
+					try {
+						Map<String, String> args = Maps.newHashMap();
+						args.put(TaskInputArgs.PASSWORD_ENCRYPTED, (String)instance.get("encryptedPassword"));
+						args.put(TaskInputArgs.ENCRYPTION_KEY, (String)instance.get("encryptionKey"));
+						info.setPassword(CryptoUtil.getPassword(args));
+
+					} catch (IllegalArgumentException e) {
+						String msg = "Encryption Key not specified. Please set the value in config.yml.";
+						logger.error(msg);
+						throw new IllegalArgumentException(msg);
+					}
 				}
 				else{
 					info.setPassword("guest");
@@ -223,9 +203,40 @@ public class RabbitMQMonitor extends AManagedMonitor {
 			logger.debug("no queue groups defined");
 		}
 
+		dictionary.putAll((Map<String, String>)configYml.get("dictionary"));
+
 	}
 
 	public static String getImplementationVersion() {
 		return RabbitMQMonitor.class.getPackage().getImplementationTitle();
+	}
+
+	public static void main(String [] args){
+
+			ConsoleAppender ca = new ConsoleAppender();
+			ca.setWriter(new OutputStreamWriter(System.out));
+			ca.setLayout(new PatternLayout("%-5p [%t]: %m%n"));
+			ca.setThreshold(Level.DEBUG);
+
+			logger.getRootLogger().addAppender(ca);
+
+			final RabbitMQMonitor monitor = new RabbitMQMonitor();
+
+			final Map<String, String> taskArgs = new HashMap<String, String>();
+			taskArgs.put("config-file", "/Users/akshay.srivastava/AppDynamics/extensions/rabbitmq-monitoring-extension/src/main/resources/config/config.yml");
+
+
+			//monitor.execute(taskArgs, null);
+
+			ScheduledExecutorService scheduler = Executors.newScheduledThreadPool(1);
+			scheduler.scheduleAtFixedRate(new Runnable() {
+				public void run() {
+					try {
+						monitor.execute(taskArgs, null);
+					} catch (Exception e) {
+						logger.error("Error while running the task", e);
+					}
+				}
+			}, 2, 30, TimeUnit.SECONDS);
 	}
 }
